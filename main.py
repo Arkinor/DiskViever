@@ -4,6 +4,7 @@ import os
 import threading
 import tkinter as tk
 from datetime import datetime
+from tkinter import filedialog
 
 import matplotlib
 import matplotlib.patches as mpatches
@@ -1118,7 +1119,7 @@ class DiskVisualizer(tk.Tk):
             self.status_var.set("Нет данных для экспорта.")
             return
 
-        file_path = tk.filedialog.asksaveasfilename(
+        file_path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV файлы", "*.csv")],
             initialfile=f"disk_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"

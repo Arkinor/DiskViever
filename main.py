@@ -1,10 +1,13 @@
 import csv
+import heapq
 import math
 import os
+import platform
+import subprocess
 import threading
 import tkinter as tk
 from datetime import datetime
-from tkinter import filedialog
+from tkinter import filedialog, ttk
 
 import matplotlib
 import matplotlib.patches as mpatches
@@ -14,6 +17,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 matplotlib.use("TkAgg")
+
+# ---------- Цвета ----------
 
 BACKGROUND_COLOR = "#0f1420"
 BACKGROUND_PANEL_COLOR = "#1a2233"
@@ -26,7 +31,15 @@ ACCENT_COLOR = "#4cc9f0"
 ACCENT_COLOR_2 = "#f72585"
 ACCENT_COLOR_3 = "#ffd60a"
 
+HOVER_BG_EXPLORER = "#2f3d5e"
+
+# ---------- Константы ----------
+
 MIN_ANGLE_DEGREES = 2.2
+MAX_CHART_SECTORS = 60
+EXPLORER_MAX_ROWS = 50
+MOTION_DEBOUNCE_MS = 15
+TOP_FILES_COUNT = 100
 
 COLOR_PALETTES = [
     ["#ff6b6b", "#ffa94d", "#ffd43b", "#a9e34b", "#69db7c", "#38d9a9", "#4dabf7", "#748ffc", "#da77f2", "#f783ac"],
@@ -37,8 +50,9 @@ COLOR_PALETTES = [
 ]
 
 
-def get_readable_size(num_bytes: int | float) -> str:
-    """Возвращает размер в человекочитаемом формате (Б, КБ, МБ и т.д.)."""
+# ---------- Утилиты ----------
+
+def get_readable_size(num_bytes):
     units = ("Б", "КБ", "МБ", "ГБ", "ТБ", "ПБ")
     value = float(num_bytes)
     for unit in units:
@@ -48,55 +62,122 @@ def get_readable_size(num_bytes: int | float) -> str:
     return f"{value:.1f} ЭБ"
 
 
-def get_color_for_level(depth: int, index: int) -> str:
+def get_color_for_level(depth, index):
     palette = COLOR_PALETTES[min(depth, len(COLOR_PALETTES) - 1)]
     return palette[index % len(palette)]
 
 
-def lighten_color(hex_color: str, factor: float = 0.35) -> str:
-    """Осветляет HEX-цвет на заданный коэффициент."""
+def lighten_color(hex_color, factor=0.35):
     color_no_hash = hex_color.lstrip("#")
     red = int(color_no_hash[0:2], 16)
     green = int(color_no_hash[2:4], 16)
     blue = int(color_no_hash[4:6], 16)
-    
     red = int(red + (255 - red) * factor)
     green = int(green + (255 - green) * factor)
     blue = int(blue + (255 - blue) * factor)
-    
     return f"#{red:02x}{green:02x}{blue:02x}"
 
 
-def get_directory_size(path: str, cache: dict) -> int:
-    """Рекурсивно считает размер каталога, используя кэш для избежания дублирования."""
+def get_directory_size(path, cache):
+    """Рекурсивно считает размер каталога с защитой от symlink-петель."""
     if path in cache:
         return cache[path]
-    
+
     total_size = 0
     stack = [path]
-    processed = set()
-    
+    visited = {os.path.realpath(path)}
+
     while stack:
         current_item = stack.pop()
-        if current_item in processed:
-            continue
-        processed.add(current_item)
-        
         try:
             with os.scandir(current_item) as iterator:
                 for entry in iterator:
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
+                            real_path = os.path.realpath(entry.path)
+                            if real_path not in visited:
+                                visited.add(real_path)
+                                stack.append(entry.path)
                         else:
                             total_size += entry.stat(follow_symlinks=False).st_size
                     except OSError:
                         continue
         except OSError:
             continue
-            
+
     cache[path] = total_size
     return total_size
+
+
+def get_all_mount_points():
+    """
+    Возвращает список точек монтирования всех физических дисков,
+    которые видны через psutil.disk_partitions.
+    """
+    mounts = []
+    seen = set()
+    for partition in psutil.disk_partitions(all=False):
+        mount = partition.mountpoint
+        # Пропускаем дубликаты и псевдо-ФС
+        if mount in seen:
+            continue
+        if platform.system() == "Windows":
+            # На Windows оставляем только реальные диски
+            if "cdrom" in partition.opts or partition.fstype == "":
+                continue
+        else:
+            # На Linux/macOS пропускаем системные псевдо-ФС
+            if partition.fstype in ("", "tmpfs", "devtmpfs", "squashfs", "overlay", "proc", "sysfs"):
+                continue
+        seen.add(mount)
+        mounts.append(mount)
+    return mounts
+
+
+def reveal_in_os(filepath):
+    """Открывает файловый менеджер ОС и выделяет указанный файл или папку."""
+    try:
+        filepath = os.path.normpath(os.path.abspath(filepath))
+    except Exception:
+        return
+    system = platform.system()
+    try:
+        if system == "Windows":
+            if os.path.isdir(filepath):
+                subprocess.Popen(f'explorer "{filepath}"', shell=True)
+            else:
+                subprocess.Popen(f'explorer /select,"{filepath}"', shell=True)
+        elif system == "Darwin":
+            if os.path.exists(filepath):
+                subprocess.Popen(['open', '-R', filepath])
+            else:
+                parent = os.path.dirname(filepath)
+                while parent and not os.path.exists(parent):
+                    parent = os.path.dirname(parent)
+                if parent:
+                    subprocess.Popen(['open', parent])
+        else:
+            # Linux / BSD
+            target_dir = filepath if os.path.isdir(filepath) else os.path.dirname(filepath)
+            if not target_dir:
+                target_dir = filepath
+            if os.path.isfile(filepath):
+                # Пробуем выделить файл через DBus (Nautilus, Dolphin, Nemo)
+                try:
+                    subprocess.Popen([
+                        'dbus-send', '--session',
+                        '--dest=org.freedesktop.FileManager1',
+                        '--type=method_call',
+                        '/org/freedesktop/FileManager1',
+                        'org.freedesktop.FileManager1.ShowItems',
+                        f'array:string:file://{filepath}', 'string:',
+                    ])
+                    return
+                except (FileNotFoundError, OSError):
+                    pass
+            subprocess.Popen(['xdg-open', target_dir])
+    except Exception as error:
+        print(f"reveal_in_os error: {error}")
 
 
 class DiskVisualizer(tk.Tk):
@@ -115,6 +196,7 @@ class DiskVisualizer(tk.Tk):
         self.minsize(1000, 700)
         self.configure(bg=BACKGROUND_COLOR)
 
+        # --- Состояние ---
         self.current_path = None
         self.current_items = []
         self.filtered_items = []
@@ -126,7 +208,13 @@ class DiskVisualizer(tk.Tk):
         self.animation_state = 0.0
         self.animation_job = None
         self.resize_job = None
+        self.motion_job = None
+        self.scan_token = 0
 
+        self.explorer_offset = 0
+        self.explorer_max_rows = EXPLORER_MAX_ROWS
+
+        # --- Объекты на холсте ---
         self.segments = []
         self.labels = []
         self.lines = []
@@ -137,12 +225,30 @@ class DiskVisualizer(tk.Tk):
 
         self.chart_radius = 1.0
         self.display_angles = []
+        self.chart_sector_to_item = []
+
+        # --- Blitting для быстрого hover ---
+        self._blit_background = None
+        self._hover_artist = None
+        self._blit_ready = False
+        self._explorer_top_y = 0.965
+        self._explorer_row_height = 0.0
+        self._explorer_start_idx = 0
+
+        # --- Контекстное меню ---
+        self.context_menu = tk.Menu(
+            self, tearoff=0, bg=BACKGROUND_PANEL_COLOR_2, fg=TEXT_COLOR_MAIN,
+            activebackground=ACCENT_COLOR, activeforeground=BACKGROUND_COLOR,
+            relief=tk.FLAT, font=("Segoe UI", 9),
+        )
 
         self.create_ui()
         self.load_disks_async()
 
         self.bind("<Configure>", self.on_resize)
         self.bind("<Escape>", lambda event: self.go_home())
+
+    # ==================== Ресайз ====================
 
     def on_resize(self, event):
         if event.widget is not self:
@@ -161,6 +267,8 @@ class DiskVisualizer(tk.Tk):
         self.figure.set_size_inches(width / self.figure.dpi, height / self.figure.dpi, forward=False)
         self.render_view(animation=False)
 
+    # ==================== UI ====================
+
     def create_ui(self):
         top_panel = tk.Frame(self, bg=BACKGROUND_PANEL_COLOR, height=56)
         top_panel.pack(fill=tk.X, side=tk.TOP)
@@ -168,9 +276,9 @@ class DiskVisualizer(tk.Tk):
 
         tooltip_panel = tk.Frame(top_panel, bg=BACKGROUND_PANEL_COLOR)
         tooltip_panel.pack(side=tk.LEFT, padx=16, pady=8)
-        
+
         self.create_tooltip(tooltip_panel, "ЛКМ", "войти", ACCENT_COLOR).pack(side=tk.LEFT, padx=(0, 12))
-        self.create_tooltip(tooltip_panel, "ПКМ", "назад", ACCENT_COLOR_2).pack(side=tk.LEFT, padx=(0, 12))
+        self.create_tooltip(tooltip_panel, "ПКМ", "меню", ACCENT_COLOR_2).pack(side=tk.LEFT, padx=(0, 12))
         self.create_tooltip(tooltip_panel, "СКМ", "вид", ACCENT_COLOR_3).pack(side=tk.LEFT, padx=(0, 12))
         self.create_tooltip(tooltip_panel, "Esc", "домой", TEXT_COLOR_DIM).pack(side=tk.LEFT)
 
@@ -186,23 +294,34 @@ class DiskVisualizer(tk.Tk):
 
         self.search_entry = tk.Entry(
             toolbar, bg=BACKGROUND_PANEL_COLOR_2, fg=TEXT_COLOR_MAIN,
-            insertbackground=TEXT_COLOR_MAIN, relief=tk.FLAT, width=20
+            insertbackground=TEXT_COLOR_MAIN, relief=tk.FLAT, width=20,
         )
         self.search_entry.pack(side=tk.LEFT, padx=(0, 8))
         self.search_entry.bind("<KeyRelease>", self.on_search_change)
 
-        sort_btn = tk.Button(
+        tk.Button(
             toolbar, text="↕ Сортировка", bg=BACKGROUND_PANEL_COLOR_3, fg=TEXT_COLOR_MAIN,
-            relief=tk.FLAT, cursor="hand2", command=self.toggle_sort
-        )
-        sort_btn.pack(side=tk.LEFT, padx=(0, 8))
+            relief=tk.FLAT, cursor="hand2", command=self.toggle_sort,
+        ).pack(side=tk.LEFT, padx=(0, 8))
 
-        export_btn = tk.Button(
+        tk.Button(
+            toolbar, text="🏆 Топ-100 по ПК", bg=BACKGROUND_PANEL_COLOR_3, fg=TEXT_COLOR_MAIN,
+            relief=tk.FLAT, cursor="hand2", command=self.show_top_files_window,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Button(
+            toolbar, text="📂 Проводник", bg=ACCENT_COLOR_2, fg=TEXT_COLOR_MAIN,
+            font=("Segoe UI", 9, "bold"), relief=tk.FLAT, cursor="hand2",
+            command=self.reveal_current_in_os,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Button(
             toolbar, text="💾 Экспорт CSV", bg=ACCENT_COLOR, fg=BACKGROUND_COLOR,
-            font=("Segoe UI", 9, "bold"), relief=tk.FLAT, cursor="hand2", command=self.export_to_csv
-        )
-        export_btn.pack(side=tk.LEFT)
+            font=("Segoe UI", 9, "bold"), relief=tk.FLAT, cursor="hand2",
+            command=self.export_to_csv,
+        ).pack(side=tk.LEFT)
 
+        # --- Figure ---
         self.figure = Figure(figsize=(10, 7), dpi=100, facecolor=BACKGROUND_COLOR)
         self.axis = self.figure.add_subplot(111)
         self.axis.set_facecolor(BACKGROUND_COLOR)
@@ -212,8 +331,14 @@ class DiskVisualizer(tk.Tk):
 
         self.canvas.mpl_connect("button_press_event", self.on_click)
         self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
-        self.canvas.get_tk_widget().bind("<Escape>", lambda event: self.go_home())
 
+        widget = self.canvas.get_tk_widget()
+        widget.bind("<MouseWheel>", self.on_mouse_wheel)
+        widget.bind("<Button-4>", self.on_mouse_wheel)
+        widget.bind("<Button-5>", self.on_mouse_wheel)
+        widget.bind("<Escape>", lambda event: self.go_home())
+
+        # --- Нижняя панель ---
         bottom_panel = tk.Frame(self, bg=BACKGROUND_PANEL_COLOR, height=32)
         bottom_panel.pack(fill=tk.X, side=tk.BOTTOM)
         bottom_panel.pack_propagate(False)
@@ -237,12 +362,17 @@ class DiskVisualizer(tk.Tk):
             font=("Segoe UI", 9, "bold"), padx=8, pady=2,
         ).pack(side=tk.LEFT)
         tk.Label(
-            frame, text=action, bg=BACKGROUND_PANEL_COLOR, fg=TEXT_COLOR_MAIN, font=("Segoe UI", 10),
+            frame, text=action, bg=BACKGROUND_PANEL_COLOR, fg=TEXT_COLOR_MAIN,
+            font=("Segoe UI", 10),
         ).pack(side=tk.LEFT, padx=(6, 0))
         return frame
 
+    # ==================== Загрузка дисков ====================
+
     def load_disks_async(self):
         self.status_var.set("Сканирование дисков…")
+        self.scan_token += 1
+        token = self.scan_token
 
         def worker():
             disks = []
@@ -252,24 +382,30 @@ class DiskVisualizer(tk.Tk):
                     disks.append((partition.mountpoint, usage.used))
                 except OSError:
                     continue
-            self.after(0, lambda: self.display_disks(disks))
+            self.after(0, lambda: self._on_disks_loaded(token, disks))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def display_disks(self, disks):
+    def _on_disks_loaded(self, token, disks):
+        if token != self.scan_token:
+            return
         if not disks:
             self.status_var.set("Диски не найдены.")
             return
-        
+
         self.current_path = None
         self.history.clear()
         self.size_cache.clear()
-        self.current_items = [(label, size) for label, size in disks]
+        self.current_items = list(disks)
         self.apply_filter()
         self.path_var.set("🖥  Мои диски")
         total_size = sum(size for _, size in disks)
-        self.status_var.set(f"Найдено дисков: {len(disks)} | Всего занято: {get_readable_size(total_size)}")
+        self.status_var.set(
+            f"Найдено дисков: {len(disks)} | Всего занято: {get_readable_size(total_size)}"
+        )
         self.render_view(animation=True)
+
+    # ==================== Рендер ====================
 
     def render_view(self, animation=False):
         self.axis.clear()
@@ -279,6 +415,7 @@ class DiskVisualizer(tk.Tk):
         for line in self.axis.spines.values():
             line.set_visible(False)
 
+        # Сброс всех визуальных объектов
         self.segments = []
         self.labels = []
         self.lines = []
@@ -289,6 +426,12 @@ class DiskVisualizer(tk.Tk):
         self.hover_index = None
         self.chart_radius = 1.0
         self.display_angles = []
+        self.chart_sector_to_item = []
+
+        # Сброс blit-состояния
+        self._blit_background = None
+        self._hover_artist = None
+        self._blit_ready = False
 
         if self.display_mode == "chart":
             self.render_chart()
@@ -299,6 +442,8 @@ class DiskVisualizer(tk.Tk):
             self.start_animation()
         else:
             self.canvas.draw_idle()
+            if self.display_mode == "explorer":
+                self.after(30, self._prepare_blit_background)
 
     def start_animation(self, steps=14, delay=16):
         if self.animation_job is not None:
@@ -314,6 +459,8 @@ class DiskVisualizer(tk.Tk):
                 self.animation_state = 1.0
                 self.apply_animation()
                 self.animation_job = None
+                if self.display_mode == "explorer":
+                    self.after(30, self._prepare_blit_background)
                 return
             self.apply_animation()
             self.animation_job = self.after(delay, tick)
@@ -407,17 +554,42 @@ class DiskVisualizer(tk.Tk):
 
         return angles
 
-    def render_chart(self):
-        data = [(name, size) for name, size in self.filtered_items if size > 0]
-        total_size = sum(size for _, size in data)
+    def _build_chart_data(self):
+        data_with_idx = [
+            (name, size, i)
+            for i, (name, size) in enumerate(self.filtered_items)
+            if size > 0
+        ]
+        if not data_with_idx:
+            return []
 
-        if not data:
-            self.axis.text(0.5, 0.5, "Нет данных для отображения", ha="center", va="center",
-                           color=TEXT_COLOR_DIM, fontsize=16, transform=self.axis.transAxes)
+        if len(data_with_idx) <= MAX_CHART_SECTORS:
+            return data_with_idx
+
+        data_with_idx.sort(key=lambda x: x[1], reverse=True)
+        head = data_with_idx[: MAX_CHART_SECTORS - 1]
+        tail = data_with_idx[MAX_CHART_SECTORS - 1:]
+        others_size = sum(item[1] for item in tail)
+        if others_size > 0:
+            head.append((f"… ещё {len(tail)} элементов", others_size, -1))
+        return head
+
+    def render_chart(self):
+        chart_data = self._build_chart_data()
+        if not chart_data:
+            self.axis.text(
+                0.5, 0.5, "Нет данных для отображения",
+                ha="center", va="center", color=TEXT_COLOR_DIM,
+                fontsize=16, transform=self.axis.transAxes,
+            )
             self.axis.axis("off")
             self.canvas.draw_idle()
             return
 
+        data = [(name, size) for name, size, _ in chart_data]
+        self.chart_sector_to_item = [idx for _, _, idx in chart_data]
+
+        total_size = sum(size for _, size in data)
         depth = len(self.history)
         count = len(data)
         sizes = [size for _, size in data]
@@ -443,23 +615,17 @@ class DiskVisualizer(tk.Tk):
         text_coord = radius + 0.32
 
         if count <= 8:
-            font_size_out = 9.0
-            label_height = 0.16
+            font_size_out, label_height = 9.0, 0.16
         elif count <= 14:
-            font_size_out = 8.3
-            label_height = 0.14
+            font_size_out, label_height = 8.3, 0.14
         elif count <= 22:
-            font_size_out = 7.6
-            label_height = 0.12
+            font_size_out, label_height = 7.6, 0.12
         elif count <= 32:
-            font_size_out = 7.0
-            label_height = 0.10
+            font_size_out, label_height = 7.0, 0.10
         elif count <= 45:
-            font_size_out = 6.4
-            label_height = 0.09
+            font_size_out, label_height = 6.4, 0.09
         else:
-            font_size_out = 5.8
-            label_height = 0.08
+            font_size_out, label_height = 5.8, 0.08
 
         icon_size = 0.09
         icon_padding = 0.035
@@ -471,11 +637,9 @@ class DiskVisualizer(tk.Tk):
             name_str = name if len(name) <= 30 else name[:28] + "…"
 
             if center_x > 0.05:
-                side = "right"
-                align = "left"
+                side, align = "right", "left"
             elif center_x < -0.05:
-                side = "left"
-                align = "right"
+                side, align = "left", "right"
             else:
                 side = "right" if center_y >= 0 else "left"
                 align = "left" if side == "right" else "right"
@@ -485,10 +649,8 @@ class DiskVisualizer(tk.Tk):
                 "color": colors[i],
                 "mid_rad": mid_rad,
                 "center_x": center_x, "center_y": center_y,
-                "side": side,
-                "align": align,
-                "name": name,
-                "size": size,
+                "side": side, "align": align,
+                "name": name, "size": size,
                 "text": f"{name_str}  ·  {get_readable_size(size)}",
                 "height": label_height,
                 "ideal_y": center_y * (radius + 0.02),
@@ -524,6 +686,7 @@ class DiskVisualizer(tk.Tk):
             for e in sorted_records:
                 e["text_y"] += offset_y
 
+        # --- Рисуем сектора ---
         fig_segments, _ = self.axis.pie(
             display_angles,
             colors=colors,
@@ -540,6 +703,7 @@ class DiskVisualizer(tk.Tk):
                 segment.set_edgecolor("#ffffff")
                 segment.set_linewidth(1.0)
 
+        # --- Подписи размеров внутри секторов ---
         for i, segment in enumerate(fig_segments):
             span = display_angles[i]
             name, size = data[i]
@@ -560,7 +724,10 @@ class DiskVisualizer(tk.Tk):
             drawn = False
 
             if span >= 6.0:
-                for font_size, pos_radius in ((9.0, 0.72), (8.0, 0.72), (7.0, 0.70), (6.5, 0.68), (6.0, 0.66), (5.5, 0.64), (5.0, 0.62), (4.5, 0.60), (4.0, 0.58)):
+                for font_size, pos_radius in (
+                    (9.0, 0.72), (8.0, 0.72), (7.0, 0.70), (6.5, 0.68),
+                    (6.0, 0.66), (5.5, 0.64), (5.0, 0.62), (4.5, 0.60), (4.0, 0.58),
+                ):
                     text_len = len(size_str) * (font_size / 16.0)
                     center_radius = radius * pos_radius
                     half_arc = (text_len / 2) / max(center_radius, 1e-6)
@@ -585,7 +752,10 @@ class DiskVisualizer(tk.Tk):
                 while radial_angle <= -90:
                     radial_angle += 180
 
-                for font_size, pos_radius in ((6.5, 0.78), (6.0, 0.78), (5.5, 0.76), (5.0, 0.74), (4.5, 0.72), (4.0, 0.70)):
+                for font_size, pos_radius in (
+                    (6.5, 0.78), (6.0, 0.78), (5.5, 0.76),
+                    (5.0, 0.74), (4.5, 0.72), (4.0, 0.70),
+                ):
                     radius_len = len(size_str) * (font_size / 110.0)
                     available_radius = radius * (1.0 - 0.30)
                     if radius_len <= available_radius:
@@ -613,6 +783,7 @@ class DiskVisualizer(tk.Tk):
                 )
                 self.labels.append(text)
 
+        # --- Выноски ---
         for e in sorted_records:
             center_x, center_y = e["center_x"], e["center_y"]
             color = e["color"]
@@ -689,22 +860,34 @@ class DiskVisualizer(tk.Tk):
             )
             self.axis.add_patch(highlight_rect)
 
+            original_item_index = self.chart_sector_to_item[index]
+
             self.hover_zones.append({
-                "x0": zone_x0, "x1": zone_x1, "y0": zone_y0, "y1": zone_y1, "index": index,
+                "x0": zone_x0, "x1": zone_x1, "y0": zone_y0, "y1": zone_y1,
+                "index": original_item_index,
             })
 
-            self.legend_items[index] = {
+            self.legend_items[original_item_index] = {
                 "text": label_text, "line": line, "dot": dot,
                 "icon_rect": icon_rect, "icon_text": icon_text,
                 "base_color": color, "zone": highlight_rect,
+                "segment_index": index,
             }
 
+        # --- Центр ---
         center_circle = mpatches.Circle((0, 0), radius * 0.30, color=BACKGROUND_COLOR, zorder=10)
         self.axis.add_patch(center_circle)
-        self.axis.text(0, radius * 0.05, get_readable_size(total_size),
-                       ha="center", va="center", color=TEXT_COLOR_MAIN, fontsize=12, fontweight="bold", zorder=11)
-        self.axis.text(0, radius * -0.07, "всего", ha="center", va="center", color=TEXT_COLOR_DIM, fontsize=9, zorder=11)
+        self.axis.text(
+            0, radius * 0.05, get_readable_size(total_size),
+            ha="center", va="center", color=TEXT_COLOR_MAIN,
+            fontsize=12, fontweight="bold", zorder=11,
+        )
+        self.axis.text(
+            0, radius * -0.07, "всего", ha="center", va="center",
+            color=TEXT_COLOR_DIM, fontsize=9, zorder=11,
+        )
 
+        # --- Границы ---
         if sorted_records:
             y_top = max(e["text_y"] for e in sorted_records)
             y_bottom = min(e["text_y"] for e in sorted_records)
@@ -727,23 +910,21 @@ class DiskVisualizer(tk.Tk):
         self.axis.axis("off")
 
     def render_explorer(self):
-        data = [(name, size) for name, size in self.filtered_items if size > 0]
+        data = self._sorted_explorer_data()
         total_size = sum(size for _, size in data)
-        
+
         if not data:
-            self.axis.text(0.5, 0.5, "Нет данных для отображения", ha="center", va="center",
-                           color=TEXT_COLOR_DIM, fontsize=16, transform=self.axis.transAxes)
+            self.axis.text(
+                0.5, 0.5, "Нет данных для отображения",
+                ha="center", va="center", color=TEXT_COLOR_DIM,
+                fontsize=16, transform=self.axis.transAxes,
+            )
             self.axis.axis("off")
             self.canvas.draw_idle()
             return
 
-        if self.sort_by_size:
-            sorted_data = sorted(data, key=lambda x: x[1], reverse=True)
-        else:
-            sorted_data = sorted(data, key=lambda x: x[0].lower())
-
         depth = len(self.history)
-        count = len(sorted_data)
+        count = len(data)
 
         x_icon = 0.030
         x_name = 0.065
@@ -756,10 +937,12 @@ class DiskVisualizer(tk.Tk):
         top_y = 0.965
         bottom_y = 0.035
 
-        max_rows = 60
-        shown = min(count, max_rows)
-        row_height = (top_y - bottom_y) / shown
-        bar_height = min(row_height * 0.50, 0.024)
+        row_height = (top_y - bottom_y) / self.explorer_max_rows
+        bar_height = max(0.006, min(row_height * 0.50, 0.024))
+
+        self._explorer_top_y = top_y
+        self._explorer_row_height = row_height
+        self._explorer_start_idx = self.explorer_offset
 
         clip_rect = mpatches.Rectangle(
             (name_col_x0, 0.0), name_col_x1 - name_col_x0, 1.0,
@@ -767,7 +950,15 @@ class DiskVisualizer(tk.Tk):
         )
         self.axis.add_patch(clip_rect)
 
-        for i, (name, size) in enumerate(sorted_data[:max_rows]):
+        start_idx = self.explorer_offset
+        end_idx = min(start_idx + self.explorer_max_rows, count)
+        visible_data = data[start_idx:end_idx]
+
+        name_to_filtered = {name: i for i, (name, _) in enumerate(self.filtered_items)}
+
+        for i, (name, size) in enumerate(visible_data):
+            item_index = name_to_filtered.get(name, None)
+
             y = top_y - i * row_height
             share = size / total_size if total_size > 0 else 0.0
             color = get_color_for_level(depth, i)
@@ -776,17 +967,31 @@ class DiskVisualizer(tk.Tk):
             if i % 2 == 0:
                 self.axis.add_patch(mpatches.Rectangle(
                     (0.0, y - row_height / 2), 1.0, row_height,
-                    facecolor=BACKGROUND_PANEL_COLOR_2, alpha=0.20, edgecolor="none", zorder=1,
-                    transform=self.axis.transAxes,
+                    facecolor=BACKGROUND_PANEL_COLOR_2, alpha=0.20,
+                    edgecolor="none", zorder=1, transform=self.axis.transAxes,
                 ))
+
+            highlight_rect = mpatches.Rectangle(
+                (0.0, y - row_height / 2), 1.0, row_height,
+                facecolor=HOVER_BG_EXPLORER, alpha=0.0,
+                edgecolor="none", zorder=2, transform=self.axis.transAxes,
+            )
+            self.axis.add_patch(highlight_rect)
 
             hit_rect = mpatches.Rectangle(
                 (0.0, y - row_height / 2), 1.0, row_height,
-                facecolor="none", edgecolor="none", zorder=2, transform=self.axis.transAxes,
+                facecolor="none", edgecolor="none", zorder=3,
+                transform=self.axis.transAxes,
             )
             self.axis.add_patch(hit_rect)
+
             self.explorer_rows.append({
-                "rect": hit_rect, "y": y, "row_h": row_height, "index": i, "_active": False,
+                "rect": hit_rect,
+                "highlight": highlight_rect,
+                "y": y,
+                "row_h": row_height,
+                "item_index": item_index,
+                "_active": False,
             })
 
             icon_size = min(row_height * 0.65, 0.022)
@@ -795,21 +1000,27 @@ class DiskVisualizer(tk.Tk):
 
             self.axis.add_patch(mpatches.FancyBboxPatch(
                 (x_icon - icon_size / 2, y - icon_size / 2), icon_size, icon_size,
-                boxstyle="round,pad=0,rounding_size=0.003", facecolor=icon_color, edgecolor="none",
-                alpha=0.9, zorder=3, transform=self.axis.transAxes,
+                boxstyle="round,pad=0,rounding_size=0.003",
+                facecolor=icon_color, edgecolor="none",
+                alpha=0.9, zorder=4, transform=self.axis.transAxes,
             ))
-            self.axis.text(x_icon, y, icon_letter, ha="center", va="center",
-                           color=BACKGROUND_COLOR, fontsize=6.5, fontweight="bold",
-                           transform=self.axis.transAxes, zorder=4)
+            self.axis.text(
+                x_icon, y, icon_letter, ha="center", va="center",
+                color=BACKGROUND_COLOR, fontsize=6.5, fontweight="bold",
+                transform=self.axis.transAxes, zorder=5,
+            )
 
-            name_text = self.axis.text(x_name, y, name, ha="left", va="center",
-                                       color=TEXT_COLOR_MAIN, fontsize=9, transform=self.axis.transAxes,
-                                       fontfamily="Consolas", zorder=4, clip_on=True)
+            name_text = self.axis.text(
+                x_name, y, name, ha="left", va="center",
+                color=TEXT_COLOR_MAIN, fontsize=9, transform=self.axis.transAxes,
+                fontfamily="Consolas", zorder=5, clip_on=True,
+            )
             name_text.set_clip_path(clip_rect)
 
             self.axis.add_patch(mpatches.FancyBboxPatch(
                 (x_bar0, y - bar_height / 2), x_bar1 - x_bar0, bar_height,
-                boxstyle="round,pad=0,rounding_size=0.003", facecolor=BACKGROUND_PANEL_COLOR_3, edgecolor="none",
+                boxstyle="round,pad=0,rounding_size=0.003",
+                facecolor=BACKGROUND_PANEL_COLOR_3, edgecolor="none",
                 alpha=0.45, zorder=2, transform=self.axis.transAxes,
             ))
 
@@ -818,38 +1029,94 @@ class DiskVisualizer(tk.Tk):
                 light_color = lighten_color(color, 0.30)
                 self.axis.add_patch(mpatches.FancyBboxPatch(
                     (x_bar0, y - bar_height / 2), fill_width, bar_height,
-                    boxstyle="round,pad=0,rounding_size=0.003", facecolor=color, edgecolor="none",
+                    boxstyle="round,pad=0,rounding_size=0.003",
+                    facecolor=color, edgecolor="none",
                     alpha=0.95, zorder=3, transform=self.axis.transAxes,
                 ))
                 self.axis.add_patch(mpatches.Rectangle(
                     (x_bar0, y + bar_height * 0.05), fill_width, bar_height * 0.30,
-                    facecolor=light_color, edgecolor="none", alpha=0.25, zorder=4,
-                    transform=self.axis.transAxes,
+                    facecolor=light_color, edgecolor="none", alpha=0.25,
+                    zorder=4, transform=self.axis.transAxes,
                 ))
 
-            self.axis.text(x_size, y, get_readable_size(size),
-                           ha="right", va="center", color=TEXT_COLOR_MAIN, fontsize=9, fontweight="bold",
-                           transform=self.axis.transAxes, fontfamily="Consolas")
+            self.axis.text(
+                x_size, y, get_readable_size(size),
+                ha="right", va="center", color=TEXT_COLOR_MAIN,
+                fontsize=9, fontweight="bold",
+                transform=self.axis.transAxes, fontfamily="Consolas",
+            )
 
-        if count > max_rows:
-            self.axis.text(0.5, bottom_y - row_height * 0.4,
-                           f"… и ещё {count - max_rows} элементов (скрыто фильтром или лимитом)",
-                           ha="center", va="center", color=TEXT_COLOR_DIM, fontsize=9, style="italic",
-                           transform=self.axis.transAxes)
+        if count > self.explorer_max_rows:
+            self.axis.text(
+                0.5, bottom_y - row_height * 0.4,
+                f"… и ещё {count - self.explorer_max_rows} элементов (колесо мыши для прокрутки)",
+                ha="center", va="center", color=TEXT_COLOR_DIM,
+                fontsize=9, style="italic", transform=self.axis.transAxes,
+            )
 
         self.axis.set_xlim(0, 1)
         self.axis.set_ylim(0, 1)
         self.axis.axis("off")
 
+    # ==================== Вспомогательные ====================
+
+    def _sorted_explorer_data(self):
+        data = [(n, s) for n, s in self.filtered_items if s > 0]
+        if self.sort_by_size:
+            return sorted(data, key=lambda x: x[1], reverse=True)
+        return sorted(data, key=lambda x: x[0].lower())
+
+    # ==================== Blitting ====================
+
+    def _prepare_blit_background(self):
+        if self.display_mode != "explorer":
+            self._blit_ready = False
+            return
+        try:
+            self.canvas.draw()
+            self._blit_background = self.canvas.copy_from_bbox(self.figure.bbox)
+            self._blit_ready = True
+        except Exception:
+            self._blit_ready = False
+
+    def _blit_hover_rect(self, row):
+        if not self._blit_ready or self._blit_background is None:
+            return False
+        try:
+            self.canvas.restore_region(self._blit_background)
+
+            if self._hover_artist is not None:
+                try:
+                    self._hover_artist.set_alpha(0.0)
+                except Exception:
+                    pass
+                self._hover_artist = None
+
+            if row is not None:
+                highlight = row["highlight"]
+                highlight.set_alpha(0.85)
+                self.axis.draw_artist(highlight)
+                self._hover_artist = highlight
+
+            self.canvas.blit(self.figure.bbox)
+            return True
+        except Exception:
+            self._blit_ready = False
+            return False
+
+    # ==================== Обработка событий ====================
+
     def on_click(self, event):
         if event.button == 2:
             self.display_mode = "explorer" if self.display_mode == "chart" else "chart"
             self.mode_var.set("● Проводник" if self.display_mode == "explorer" else "● Диаграмма")
+            self.explorer_offset = 0
+            self.hover_index = None
             self.render_view(animation=True)
             return
 
         if event.button == 3:
-            self.go_back()
+            self.show_context_menu(event)
             return
 
         if event.button != 1:
@@ -868,13 +1135,71 @@ class DiskVisualizer(tk.Tk):
             index = self.find_explorer_row(event.ydata)
             if index is None:
                 return
-            if self.sort_by_size:
-                sorted_data = sorted([(n, s) for n, s in self.filtered_items if s > 0], key=lambda x: x[1], reverse=True)
-            else:
-                sorted_data = sorted([(n, s) for n, s in self.filtered_items if s > 0], key=lambda x: x[0].lower())
-            name, _ = sorted_data[index]
+            name, _ = self.filtered_items[index]
 
         self.navigate_to_item(name)
+
+    def show_context_menu(self, event):
+        self.context_menu.delete(0, tk.END)
+
+        index = None
+        if self.display_mode == "chart":
+            index = self.find_hover_zone(event.xdata, event.ydata)
+            if index is None:
+                index = self.find_chart_sector(event.xdata, event.ydata)
+        else:
+            index = self.find_explorer_row(event.ydata)
+
+        if index is not None and 0 <= index < len(self.filtered_items):
+            item_name, _ = self.filtered_items[index]
+            is_dir = item_name.endswith(os.sep)
+            display_name = item_name.rstrip(os.sep)
+
+            self.context_menu.add_command(
+                label=f"📄 {display_name[:40]}", state=tk.DISABLED,
+            )
+            self.context_menu.add_separator()
+
+            if is_dir:
+                self.context_menu.add_command(
+                    label="📂 Открыть каталог",
+                    command=lambda n=item_name: self.navigate_to_item(n),
+                )
+
+            if self.current_path is None:
+                full_path = item_name.rstrip(os.sep)
+            else:
+                full_path = os.path.join(self.current_path, item_name.rstrip(os.sep))
+
+            self.context_menu.add_command(
+                label="📂 Показать в проводнике",
+                command=lambda p=full_path: reveal_in_os(p),
+            )
+            self.context_menu.add_command(
+                label="📋 Копировать путь",
+                command=lambda p=full_path: self.clipboard_set(p),
+            )
+            self.context_menu.add_separator()
+
+        self.context_menu.add_command(label="⬅ Назад", command=self.go_back)
+        self.context_menu.add_command(label="🏠 Домой", command=self.go_home)
+
+        x_root = self.winfo_pointerx()
+        y_root = self.winfo_pointery()
+
+        try:
+            self.context_menu.tk_popup(x_root, y_root)
+        finally:
+            self.context_menu.grab_release()
+
+    def clipboard_set(self, text):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+            self.status_var.set(f"Скопировано: {text}")
+        except tk.TclError as error:
+            self.status_var.set(f"Не удалось скопировать: {error}")
 
     def find_chart_sector(self, x, y):
         if x is None or y is None:
@@ -890,26 +1215,30 @@ class DiskVisualizer(tk.Tk):
         accumulator = 0.0
         for i, degree in enumerate(self.display_angles):
             if passed < accumulator + degree:
-                return i
+                if 0 <= i < len(self.chart_sector_to_item):
+                    return self.chart_sector_to_item[i]
+                return None
             accumulator += degree
-        return len(self.display_angles) - 1
+        if self.chart_sector_to_item:
+            return self.chart_sector_to_item[-1]
+        return None
 
     def find_explorer_row(self, y):
         if y is None or not self.explorer_rows:
             return None
-        rows = self.explorer_rows
-        low, high = 0, len(rows) - 1
-        while low <= high:
-            mid = (low + high) // 2
-            row = rows[mid]
-            diff_y = row["y"] - y
-            if abs(diff_y) <= row["row_h"] / 2:
-                return row["index"]
-            if diff_y < 0:
-                high = mid - 1
-            else:
-                low = mid + 1
-        return None
+        if self._explorer_row_height <= 0:
+            return None
+
+        i_float = (self._explorer_top_y - y) / self._explorer_row_height
+        i = int(round(i_float))
+
+        if i < 0 or i >= len(self.explorer_rows):
+            return None
+
+        row = self.explorer_rows[i]
+        if abs(row["y"] - y) > row["row_h"] / 2 + 1e-9:
+            return None
+        return row["item_index"]
 
     def find_hover_zone(self, x, y):
         if x is None or y is None:
@@ -920,27 +1249,73 @@ class DiskVisualizer(tk.Tk):
         return None
 
     def on_mouse_move(self, event):
+        if self.motion_job is not None:
+            return
+        self.motion_job = self.after(MOTION_DEBOUNCE_MS, lambda: self._process_motion(event))
+
+    def _process_motion(self, event):
+        self.motion_job = None
+
         if self.animation_job is not None:
             return
 
         if event.inaxes != self.axis:
             if self.hover_index is not None:
-                self.apply_hover(None)
+                self.hover_index = None
+                if self.display_mode == "explorer":
+                    self._apply_hover_explorer(None)
+                else:
+                    self._apply_hover_chart(None)
             self.set_cursor("")
             return
 
-        if self.display_mode == "chart":
-            index = self.find_hover_zone(event.xdata, event.ydata)
-            if index is None:
-                index = self.find_chart_sector(event.xdata, event.ydata)
-        else:
+        if self.display_mode == "explorer":
             index = self.find_explorer_row(event.ydata)
+            if index != self.hover_index:
+                self.hover_index = index
+                self._apply_hover_explorer(index)
+            self.set_cursor("hand2" if index is not None else "")
+            return
+
+        index = self.find_hover_zone(event.xdata, event.ydata)
+        if index is None:
+            index = self.find_chart_sector(event.xdata, event.ydata)
 
         if index == self.hover_index:
             return
 
-        self.apply_hover(index)
+        self.hover_index = index
+        self._apply_hover_chart(index)
         self.set_cursor("hand2" if index is not None else "")
+
+    def on_mouse_wheel(self, event):
+        if self.display_mode != "explorer":
+            return
+
+        data = self._sorted_explorer_data()
+        max_possible_offset = max(0, len(data) - self.explorer_max_rows)
+
+        if max_possible_offset <= 0:
+            return
+
+        if hasattr(event, "delta") and event.delta != 0:
+            direction = -1 if event.delta > 0 else 1
+        elif getattr(event, "num", None) == 4:
+            direction = -1
+        elif getattr(event, "num", None) == 5:
+            direction = 1
+        else:
+            return
+
+        new_offset = self.explorer_offset + direction
+        new_offset = max(0, min(new_offset, max_possible_offset))
+
+        if new_offset == self.explorer_offset:
+            return
+
+        self.explorer_offset = new_offset
+        self.hover_index = None
+        self.render_view(animation=False)
 
     def set_cursor(self, name):
         try:
@@ -948,22 +1323,63 @@ class DiskVisualizer(tk.Tk):
         except tk.TclError:
             pass
 
-    def apply_hover(self, index):
-        if index == self.hover_index:
-            return
-        self.hover_index = index
+    def _apply_hover_explorer(self, index):
+        if self._blit_ready:
+            target_row = None
+            if index is not None:
+                for row in self.explorer_rows:
+                    if row["item_index"] == index:
+                        target_row = row
+                        break
 
-        if self.display_mode == "chart":
-            for i, segment in enumerate(self.segments):
-                if index is None:
-                    segment.set_alpha(1.0)
-                elif i == index:
-                    segment.set_alpha(1.0)
-                else:
-                    segment.set_alpha(0.25)
+            if self._hover_artist is not None:
+                for row in self.explorer_rows:
+                    if row["highlight"] is self._hover_artist:
+                        row["_active"] = False
+                        break
 
-            for i, item in self.legend_items.items():
-                if index is None:
+            if self._blit_hover_rect(target_row):
+                if target_row is not None:
+                    target_row["_active"] = True
+                return
+
+        # Fallback
+        changed = False
+        for row in self.explorer_rows:
+            if index is None:
+                if row["_active"]:
+                    row["highlight"].set_alpha(0.0)
+                    row["_active"] = False
+                    changed = True
+            elif row["item_index"] == index:
+                if not row["_active"]:
+                    row["highlight"].set_alpha(0.85)
+                    row["_active"] = True
+                    changed = True
+            else:
+                if row["_active"]:
+                    row["highlight"].set_alpha(0.0)
+                    row["_active"] = False
+                    changed = True
+        if changed:
+            self.canvas.draw_idle()
+
+    def _apply_hover_chart(self, index):
+        changed = False
+
+        for i, segment in enumerate(self.segments):
+            original_index = (
+                self.chart_sector_to_item[i]
+                if i < len(self.chart_sector_to_item) else None
+            )
+            target_alpha = 1.0 if (index is None or original_index == index) else 0.25
+            if abs((segment.get_alpha() or 1.0) - target_alpha) > 1e-6:
+                segment.set_alpha(target_alpha)
+                changed = True
+
+        for original_index, item in self.legend_items.items():
+            if index is None:
+                if item["line"].get_linewidth() != 1.4:
                     item["line"].set_linewidth(1.4)
                     item["line"].set_alpha(1.0)
                     item["dot"].set_alpha(1.0)
@@ -975,7 +1391,9 @@ class DiskVisualizer(tk.Tk):
                     item["zone"].set_alpha(0.0)
                     item["zone"].set_edgecolor("none")
                     item["zone"].set_linewidth(0.0)
-                elif i == index:
+                    changed = True
+            elif original_index == index:
+                if item["line"].get_linewidth() != 3.2:
                     item["line"].set_linewidth(3.2)
                     item["line"].set_alpha(1.0)
                     item["dot"].set_alpha(1.0)
@@ -987,7 +1405,9 @@ class DiskVisualizer(tk.Tk):
                     item["zone"].set_alpha(0.35)
                     item["zone"].set_edgecolor(item["base_color"])
                     item["zone"].set_linewidth(1.4)
-                else:
+                    changed = True
+            else:
+                if item["line"].get_linewidth() != 1.0:
                     item["line"].set_linewidth(1.0)
                     item["line"].set_alpha(0.10)
                     item["dot"].set_alpha(0.10)
@@ -999,22 +1419,12 @@ class DiskVisualizer(tk.Tk):
                     item["zone"].set_alpha(0.0)
                     item["zone"].set_edgecolor("none")
                     item["zone"].set_linewidth(0.0)
+                    changed = True
 
-        elif self.display_mode == "explorer":
-            for row in self.explorer_rows:
-                new_state = (index is not None and row["index"] == index)
-                old_state = row.get("_active", False)
-                if new_state == old_state:
-                    continue
-                row["_active"] = new_state
-                if new_state:
-                    row["rect"].set_facecolor(ACCENT_COLOR)
-                    row["rect"].set_alpha(0.12)
-                else:
-                    row["rect"].set_facecolor("none")
-                    row["rect"].set_alpha(0.0)
+        if changed:
+            self.canvas.draw_idle()
 
-        self.canvas.draw_idle()
+    # ==================== Навигация ====================
 
     def navigate_to_item(self, name):
         if self.current_path is None:
@@ -1027,10 +1437,12 @@ class DiskVisualizer(tk.Tk):
             return
 
         self.status_var.set(f"Сканирование {target}…")
+        self.scan_token += 1
+        token = self.scan_token
 
         def worker():
             items = self.scan_directory(target)
-            self.after(0, lambda: self.display_directory(target, items))
+            self.after(0, lambda: self._on_directory_scanned(token, target, items, push_history=True))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1040,7 +1452,7 @@ class DiskVisualizer(tk.Tk):
             entries = list(os.scandir(path))
         except OSError:
             return results
-            
+
         for entry in entries:
             try:
                 if entry.is_dir(follow_symlinks=False):
@@ -1051,18 +1463,26 @@ class DiskVisualizer(tk.Tk):
                     results.append((entry.name, size))
             except OSError:
                 continue
-                
+
         results.sort(key=lambda x: x[1], reverse=True)
         return results
 
-    def display_directory(self, path, items):
-        self.history.append(self.current_path)
+    def _on_directory_scanned(self, token, path, items, push_history):
+        if token != self.scan_token:
+            return
+
+        if push_history:
+            self.history.append(self.current_path)
         self.current_path = path
         self.current_items = items
+        self.explorer_offset = 0
+        self.hover_index = None
         self.apply_filter()
         self.path_var.set(f"📁  {path}")
         total_size = sum(s for _, s in items)
-        self.status_var.set(f"Элементов: {len(items)} | Всего: {get_readable_size(total_size)}")
+        self.status_var.set(
+            f"Элементов: {len(items)} | Всего: {get_readable_size(total_size)}"
+        )
         self.render_view(animation=True)
 
     def go_back(self):
@@ -1075,21 +1495,14 @@ class DiskVisualizer(tk.Tk):
             return
 
         self.status_var.set(f"Возврат в {prev}…")
+        self.scan_token += 1
+        token = self.scan_token
 
         def worker():
             items = self.scan_directory(prev)
-            self.after(0, lambda: self.display_directory_back(prev, items))
+            self.after(0, lambda: self._on_directory_scanned(token, prev, items, push_history=False))
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def display_directory_back(self, path, items):
-        self.current_path = path
-        self.current_items = items
-        self.apply_filter()
-        self.path_var.set(f"📁  {path}")
-        total_size = sum(s for _, s in items)
-        self.status_var.set(f"Элементов: {len(items)} | Всего: {get_readable_size(total_size)}")
-        self.render_view(animation=True)
 
     def go_home(self):
         if self.current_path is None:
@@ -1097,22 +1510,339 @@ class DiskVisualizer(tk.Tk):
             return
         self.history.clear()
         self.search_entry.delete(0, tk.END)
+        self.explorer_offset = 0
+        self.hover_index = None
         self.load_disks_async()
 
     def on_search_change(self, event):
         self.apply_filter()
+        self.explorer_offset = 0
+        self.hover_index = None
         self.render_view(animation=False)
 
     def apply_filter(self):
         search_text = self.search_entry.get().strip().lower()
         if not search_text:
-            self.filtered_items = self.current_items
+            self.filtered_items = list(self.current_items)
         else:
-            self.filtered_items = [(name, size) for name, size in self.current_items if search_text in name.lower()]
+            self.filtered_items = [
+                (name, size)
+                for name, size in self.current_items
+                if search_text in name.lower()
+            ]
 
     def toggle_sort(self):
         self.sort_by_size = not self.sort_by_size
+        self.explorer_offset = 0
+        self.hover_index = None
         self.render_view(animation=False)
+
+    def reveal_current_in_os(self):
+        if self.current_path:
+            reveal_in_os(self.current_path)
+            self.status_var.set(f"Открыто в проводнике: {self.current_path}")
+        else:
+            self.status_var.set("Выберите каталог для открытия.")
+
+    # ==================== Топ-100 файлов по всему ПК ====================
+
+    def show_top_files_window(self):
+        """Сканирует ВСЕ диски ПК и показывает топ-100 самых больших файлов."""
+        mount_points = get_all_mount_points()
+        if not mount_points:
+            self.status_var.set("Не найдено ни одного диска для сканирования.")
+            return
+
+        top_n = TOP_FILES_COUNT
+        self.status_var.set(f"Поиск топ-{top_n} файлов по всему ПК…")
+
+        # --- Окно прогресса ---
+        progress_win = tk.Toplevel(self)
+        progress_win.title("Сканирование всего ПК…")
+        progress_win.geometry("520x180")
+        progress_win.configure(bg=BACKGROUND_PANEL_COLOR)
+        progress_win.transient(self)
+        progress_win.resizable(False, False)
+        progress_win.protocol("WM_DELETE_WINDOW", lambda: on_cancel())
+
+        progress_win.update_idletasks()
+        px = self.winfo_rootx() + (self.winfo_width() - 520) // 2
+        py = self.winfo_rooty() + (self.winfo_height() - 180) // 2
+        progress_win.geometry(f"+{max(px, 0)}+{max(py, 0)}")
+
+        tk.Label(
+            progress_win,
+            text=f"🏆 Поиск топ-{top_n} самых больших файлов на всём ПК",
+            bg=BACKGROUND_PANEL_COLOR, fg=ACCENT_COLOR,
+            font=("Segoe UI", 11, "bold"),
+        ).pack(pady=(16, 6))
+
+        tk.Label(
+            progress_win,
+            text="Сканируются диски: " + ", ".join(mount_points),
+            bg=BACKGROUND_PANEL_COLOR, fg=TEXT_COLOR_DIM,
+            font=("Segoe UI", 8),
+        ).pack(pady=(0, 6))
+
+        progress_label_var = tk.StringVar(value="0 файлов просканировано")
+        tk.Label(
+            progress_win, textvariable=progress_label_var,
+            bg=BACKGROUND_PANEL_COLOR, fg=TEXT_COLOR_MAIN,
+            font=("Segoe UI", 9),
+        ).pack(pady=(0, 8))
+
+        progress_bar = ttk.Progressbar(
+            progress_win, mode="indeterminate", length=460,
+        )
+        progress_bar.pack(pady=(0, 10))
+        progress_bar.start(15)
+
+        cancel_flag = {"cancelled": False}
+
+        def on_cancel():
+            cancel_flag["cancelled"] = True
+            try:
+                progress_bar.stop()
+                progress_win.destroy()
+            except tk.TclError:
+                pass
+            self.status_var.set("Сканирование отменено.")
+
+        tk.Button(
+            progress_win, text="Отмена", command=on_cancel,
+            bg=BACKGROUND_PANEL_COLOR_3, fg=TEXT_COLOR_MAIN,
+            relief=tk.FLAT, cursor="hand2", padx=20,
+        ).pack(pady=(0, 12))
+
+        def worker():
+            top_files = []          # список (size, filepath)
+            scanned = 0
+            last_update = [0]
+            skipped_errors = 0
+
+            def on_walk_error(error):
+                nonlocal skipped_errors
+                skipped_errors += 1
+                # не падаем — пропускаем недоступные каталоги
+
+            try:
+                for mount in mount_points:
+                    if cancel_flag["cancelled"]:
+                        return
+
+                    for dirpath, dirnames, filenames in os.walk(
+                        mount, onerror=on_walk_error, followlinks=False
+                    ):
+                        if cancel_flag["cancelled"]:
+                            return
+
+                        # Пропускаем псевдо-ФС и мусорные каталоги на Linux
+                        if platform.system() == "Linux":
+                            base = os.path.basename(dirpath)
+                            if base in ("proc", "sys", "dev", "run", "snap", "boot"):
+                                dirnames[:] = []
+                                continue
+
+                        for filename in filenames:
+                            filepath = os.path.join(dirpath, filename)
+                            try:
+                                size = os.path.getsize(filepath)
+                            except OSError:
+                                continue
+                            if size <= 0:
+                                continue
+
+                            top_files.append((size, filepath))
+                            scanned += 1
+
+                            # Периодически чистим
+                            if len(top_files) > top_n * 4:
+                                top_files.sort(key=lambda x: x[0], reverse=True)
+                                del top_files[top_n:]
+
+                            if scanned - last_update[0] >= 3000:
+                                last_update[0] = scanned
+                                try:
+                                    self.after(
+                                        0,
+                                        lambda s=scanned: progress_label_var.set(
+                                            f"{s} файлов просканировано…"
+                                        ),
+                                    )
+                                except tk.TclError:
+                                    return
+
+                # Финальная сортировка
+                top_files.sort(key=lambda x: x[0], reverse=True)
+                top_files = top_files[:top_n]
+
+                def finish():
+                    try:
+                        progress_bar.stop()
+                        progress_win.destroy()
+                    except tk.TclError:
+                        pass
+                    self._display_top_files_ui(
+                        top_files, "весь ПК", top_n, skipped_errors
+                    )
+
+                try:
+                    self.after(0, finish)
+                except tk.TclError:
+                    pass
+
+            except Exception as error:
+                def show_error(err=error):
+                    try:
+                        progress_win.destroy()
+                    except tk.TclError:
+                        pass
+                    self.status_var.set(f"Ошибка поиска: {err}")
+                try:
+                    self.after(0, show_error)
+                except tk.TclError:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _display_top_files_ui(self, top_files, root_path, top_n=100, skipped_errors=0):
+        if not top_files:
+            self.status_var.set(f"Файлы не найдены ({root_path}).")
+            return
+
+        top_win = tk.Toplevel(self)
+        top_win.title(f"Топ-{top_n} файлов: {root_path}")
+        top_win.geometry("950x650")
+        top_win.configure(bg=BACKGROUND_PANEL_COLOR)
+        top_win.transient(self)
+
+        # Заголовок
+        header = tk.Frame(top_win, bg=BACKGROUND_PANEL_COLOR)
+        header.pack(fill=tk.X, padx=12, pady=(12, 6))
+
+        tk.Label(
+            header, text=f"🏆 Топ-{top_n} самых больших файлов ({root_path})",
+            bg=BACKGROUND_PANEL_COLOR, fg=ACCENT_COLOR,
+            font=("Segoe UI", 12, "bold"),
+        ).pack(side=tk.LEFT)
+
+        total_found = sum(s for s, _ in top_files)
+        tk.Label(
+            header,
+            text=f"Суммарно: {get_readable_size(total_found)}",
+            bg=BACKGROUND_PANEL_COLOR, fg=TEXT_COLOR_DIM,
+            font=("Segoe UI", 10),
+        ).pack(side=tk.RIGHT)
+
+        # Стиль Treeview
+        style = ttk.Style(top_win)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(
+            "Treeview", background=BACKGROUND_PANEL_COLOR_2,
+            foreground=TEXT_COLOR_MAIN, fieldbackground=BACKGROUND_PANEL_COLOR_2,
+            borderwidth=0, rowheight=24,
+        )
+        style.configure(
+            "Treeview.Heading", background=BACKGROUND_PANEL_COLOR_3,
+            foreground=TEXT_COLOR_MAIN, font=("Segoe UI", 9, "bold"),
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", ACCENT_COLOR)],
+            foreground=[("selected", BACKGROUND_COLOR)],
+        )
+
+        container = tk.Frame(top_win, bg=BACKGROUND_PANEL_COLOR)
+        container.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+
+        columns = ("rank", "size", "path")
+        tree = ttk.Treeview(
+            container, columns=columns, show="headings", style="Treeview",
+        )
+        tree.heading("rank", text="#")
+        tree.heading("size", text="Размер")
+        tree.heading("path", text="Путь к файлу")
+        tree.column("rank", width=50, anchor=tk.CENTER, stretch=False)
+        tree.column("size", width=110, anchor=tk.E, stretch=False)
+        tree.column("path", width=720, anchor=tk.W)
+
+        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscroll=scrollbar.set)
+
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Цветовые теги для топ-3
+        tree.tag_configure("gold", foreground="#ffd60a")
+        tree.tag_configure("silver", foreground="#c0c0c0")
+        tree.tag_configure("bronze", foreground="#cd7f32")
+
+        for i, (size, filepath) in enumerate(top_files, start=1):
+            if i == 1:
+                tags = ("gold",)
+            elif i == 2:
+                tags = ("silver",)
+            elif i == 3:
+                tags = ("bronze",)
+            else:
+                tags = ()
+            tree.insert(
+                "", tk.END,
+                values=(i, get_readable_size(size), filepath),
+                tags=tags,
+            )
+
+        def on_double_click(event):
+            item = tree.identify_row(event.y)
+            if item:
+                values = tree.item(item, "values")
+                if len(values) >= 3:
+                    filepath = values[2]
+                    if os.path.exists(filepath):
+                        reveal_in_os(filepath)
+
+        tree.bind("<Double-1>", on_double_click)
+
+        def on_tree_right_click(event):
+            item = tree.identify_row(event.y)
+            if item:
+                tree.selection_set(item)
+                values = tree.item(item, "values")
+                if len(values) >= 3:
+                    filepath = values[2]
+                    menu = tk.Menu(
+                        top_win, tearoff=0,
+                        bg=BACKGROUND_PANEL_COLOR_2, fg=TEXT_COLOR_MAIN,
+                        activebackground=ACCENT_COLOR,
+                        activeforeground=BACKGROUND_COLOR,
+                    )
+                    menu.add_command(
+                        label="📂 Показать в проводнике",
+                        command=lambda p=filepath: reveal_in_os(p),
+                    )
+                    menu.add_command(
+                        label="📋 Копировать путь",
+                        command=lambda p=filepath: self.clipboard_set(p),
+                    )
+                    try:
+                        menu.tk_popup(event.x_root, event.y_root)
+                    finally:
+                        menu.grab_release()
+
+        tree.bind("<Button-3>", on_tree_right_click)
+
+        status = (
+            f"Найдено топ-{len(top_files)} файлов. "
+            f"Суммарный размер: {get_readable_size(total_found)}"
+        )
+        if skipped_errors > 0:
+            status += f" | Пропущено недоступных мест: {skipped_errors}"
+        self.status_var.set(status)
+
+    # ==================== Экспорт ====================
 
     def export_to_csv(self):
         if not self.filtered_items:
@@ -1122,19 +1852,21 @@ class DiskVisualizer(tk.Tk):
         file_path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV файлы", "*.csv")],
-            initialfile=f"disk_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            initialfile=f"disk_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         )
-        
+
         if not file_path:
             return
 
         try:
-            with open(file_path, mode='w', encoding='utf-8-sig', newline='') as file:
-                writer = csv.writer(file, delimiter=';')
+            with open(file_path, mode="w", encoding="utf-8-sig", newline="") as file:
+                writer = csv.writer(file, delimiter=";")
                 writer.writerow(["Имя", "Размер (байт)", "Размер (формат)", "Тип"])
                 for name, size in self.filtered_items:
                     item_type = "Каталог" if name.endswith(os.sep) else "Файл"
-                    writer.writerow([name.rstrip(os.sep), size, get_readable_size(size), item_type])
+                    writer.writerow([
+                        name.rstrip(os.sep), size, get_readable_size(size), item_type,
+                    ])
             self.status_var.set(f"Экспорт выполнен: {file_path}")
         except Exception as error:
             self.status_var.set(f"Ошибка экспорта: {error}")

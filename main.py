@@ -3,8 +3,11 @@ import heapq
 import math
 import os
 import platform
+import queue
+import stat
 import subprocess
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, ttk
@@ -16,30 +19,51 @@ import psutil
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+import theme
+import ui_kit
+from smartclean.ui_tab import SmartCleanerTab
+
 matplotlib.use("TkAgg")
 
-# ---------- Цвета ----------
+# ---------- Цвета (из theme.py) ----------
 
-BACKGROUND_COLOR = "#0f1420"
-BACKGROUND_PANEL_COLOR = "#1a2233"
-BACKGROUND_PANEL_COLOR_2 = "#232d44"
-BACKGROUND_PANEL_COLOR_3 = "#2d3854"
-TEXT_COLOR_MAIN = "#e8f0ff"
-TEXT_COLOR_DIM = "#8fa3c4"
-TEXT_COLOR_DIM_2 = "#5d6b85"
-ACCENT_COLOR = "#4cc9f0"
-ACCENT_COLOR_2 = "#f72585"
-ACCENT_COLOR_3 = "#ffd60a"
+BACKGROUND_COLOR = theme.BACKGROUND_COLOR
+BACKGROUND_PANEL_COLOR = theme.BACKGROUND_PANEL_COLOR
+BACKGROUND_PANEL_COLOR_2 = theme.BACKGROUND_PANEL_COLOR_2
+BACKGROUND_PANEL_COLOR_3 = theme.BACKGROUND_PANEL_COLOR_3
+TEXT_COLOR_MAIN = theme.TEXT_COLOR_MAIN
+TEXT_COLOR_DIM = theme.TEXT_COLOR_DIM
+TEXT_COLOR_DIM_2 = theme.TEXT_COLOR_DIM_2
+ACCENT_COLOR = theme.ACCENT_COLOR
+ACCENT_COLOR_2 = theme.ACCENT_COLOR_2
+ACCENT_COLOR_3 = theme.ACCENT_COLOR_3
 
-HOVER_BG_EXPLORER = "#2f3d5e"
+HOVER_BG_EXPLORER = theme.HOVER_BG_EXPLORER
 
 # ---------- Константы ----------
 
 MIN_ANGLE_DEGREES = 2.2
 MAX_CHART_SECTORS = 60
 EXPLORER_MAX_ROWS = 50
-MOTION_DEBOUNCE_MS = 15
+MOTION_DEBOUNCE_MS = 40
+WHEEL_DEBOUNCE_MS = 40
 TOP_FILES_COUNT = 100
+AUTO_REFRESH_INTERVAL_MS = 4000
+HEADER_HEIGHT = 96
+FOOTER_HEIGHT = 34
+
+# Плавная анимация — это 14 полных перерисовок холста подряд. На больших
+# срезах одна такая перерисовка уже занимает заметное время, поэтому
+# анимация отключается, когда элементов много.
+ANIMATION_MAX_ITEMS = 12
+# Обводка текста (path_effects) рисуется в несколько проходов и является
+# самой дорогой операцией при отрисовке. При большом числе подписей от
+# неё отказываемся — экономия кратно превышает всё остальное.
+LABEL_STROKE_MAX_ITEMS = 18
+# Полная пересканиация каталога ради автообновления на больших срезах
+# вешает интерфейс сильнее, чем просроченные данные.
+AUTO_REFRESH_MAX_ITEMS = 1500
+SEARCH_RENDER_DELAY_MS = 150
 
 COLOR_PALETTES = [
     ["#ff6b6b", "#ffa94d", "#ffd43b", "#a9e34b", "#69db7c", "#38d9a9", "#4dabf7", "#748ffc", "#da77f2", "#f783ac"],
@@ -78,28 +102,66 @@ def lighten_color(hex_color, factor=0.35):
     return f"#{red:02x}{green:02x}{blue:02x}"
 
 
-def get_directory_size(path, cache):
-    """Рекурсивно считает размер каталога с защитой от symlink-петель."""
+def _is_reparse_point(entry):
+    """Проверяет, что каталог — ссылка/точка повторной обработки (Windows)."""
+    try:
+        if entry.is_symlink():
+            return True
+    except OSError:
+        return False
+    try:
+        attrs = entry.stat(follow_symlinks=False).st_file_attributes
+    except (OSError, AttributeError):
+        return False
+    return bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def get_directory_size(path, cache, progress_cb=None, cancel_event=None):
+    """Рекурсивно считает размер каталога с защитой от symlink-петель.
+
+    progress_cb(current_dir, files_seen, bytes_seen) вызывается не чаще,
+    чем раз в 0.2 с. При отмене возвращает None, чтобы не кэшировать
+    частичный результат.
+    """
     if path in cache:
         return cache[path]
 
     total_size = 0
+    file_count = 0
     stack = [path]
     visited = {os.path.realpath(path)}
+    last_progress = 0.0
 
     while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         current_item = stack.pop()
+        if progress_cb is not None:
+            now = time.monotonic()
+            if now - last_progress >= 0.2:
+                last_progress = now
+                try:
+                    progress_cb(current_item, file_count, total_size)
+                except Exception:
+                    progress_cb = None
         try:
             with os.scandir(current_item) as iterator:
                 for entry in iterator:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return None
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            real_path = os.path.realpath(entry.path)
-                            if real_path not in visited:
+                            # realpath нужен только для ссылок/точек повторной
+                            # обработки: для обычных каталогов он сильно тормозит.
+                            if _is_reparse_point(entry):
+                                real_path = os.path.realpath(entry.path)
+                                if real_path in visited:
+                                    continue
                                 visited.add(real_path)
-                                stack.append(entry.path)
+                            stack.append(entry.path)
                         else:
                             total_size += entry.stat(follow_symlinks=False).st_size
+                            file_count += 1
                     except OSError:
                         continue
         except OSError:
@@ -183,7 +245,7 @@ def reveal_in_os(filepath):
 class DiskVisualizer(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Disk Space Visualizer")
+        self.title("DiskViever — умный визуализатор дисков")
 
         try:
             self.state("zoomed")
@@ -210,6 +272,23 @@ class DiskVisualizer(tk.Tk):
         self.resize_job = None
         self.motion_job = None
         self.scan_token = 0
+        self._scan_cancel = threading.Event()
+        # Кэш отсортированного вида — вычисляется один раз и используется при
+        # прокрутке колесом и перерисовке, чтобы не сортировать список заново
+        # на каждое движение мыши и каждое событие колеса.
+        self._explorer_sorted = None
+        self._render_job = None
+
+        # --- Индикатор занятости ---
+        self.busy = False
+        self.busy_text = ""
+        self._status_queue = queue.Queue(maxsize=1)
+        self._poll_job = None
+
+        # --- Автообновление ---
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+        self._auto_job = None
+        self._current_dir_mtime = None
 
         self.explorer_offset = 0
         self.explorer_max_rows = EXPLORER_MAX_ROWS
@@ -242,16 +321,33 @@ class DiskVisualizer(tk.Tk):
             relief=tk.FLAT, font=("Segoe UI", 9),
         )
 
+        self._configure_notebook_style()
+
+        # --- Вкладки ---
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.viz_frame = tk.Frame(self.notebook, bg=BACKGROUND_COLOR)
+        self.notebook.add(self.viz_frame, text="  📊 Визуализатор  ")
+
+        self.cleaner_tab = SmartCleanerTab(self.notebook)
+        self.notebook.add(self.cleaner_tab, text="  🧹 Умная очистка  ")
+
         self.create_ui()
         self.load_disks_async()
 
-        self.bind("<Configure>", self.on_resize)
+        self.viz_frame.bind("<Configure>", self.on_resize)
         self.bind("<Escape>", lambda event: self.go_home())
+
+        self._auto_job = self.after(AUTO_REFRESH_INTERVAL_MS, self._auto_refresh_tick)
+
+    def _configure_notebook_style(self):
+        ui_kit.apply_ttk_styles(self)
 
     # ==================== Ресайз ====================
 
     def on_resize(self, event):
-        if event.widget is not self:
+        if event.widget is not self.viz_frame:
             return
         if self.resize_job is not None:
             try:
@@ -262,71 +358,136 @@ class DiskVisualizer(tk.Tk):
 
     def finish_resize(self):
         self.resize_job = None
-        width = max(self.winfo_width(), 400)
-        height = max(self.winfo_height() - 80, 300)
+        width = max(self.viz_frame.winfo_width(), 400)
+        header_h = self.top_panel.winfo_height()
+        footer_h = self.bottom_panel.winfo_height()
+        if header_h <= 1:
+            header_h = HEADER_HEIGHT
+        if footer_h <= 1:
+            footer_h = FOOTER_HEIGHT
+        height = max(self.viz_frame.winfo_height() - header_h - footer_h, 300)
         self.figure.set_size_inches(width / self.figure.dpi, height / self.figure.dpi, forward=False)
         self.render_view(animation=False)
 
     # ==================== UI ====================
 
     def create_ui(self):
-        top_panel = tk.Frame(self, bg=BACKGROUND_PANEL_COLOR, height=56)
+        # ---------- Верхняя панель: навигация и поиск ----------
+        top_panel = tk.Frame(self.viz_frame, bg=BACKGROUND_PANEL_COLOR)
         top_panel.pack(fill=tk.X, side=tk.TOP)
-        top_panel.pack_propagate(False)
+        self.top_panel = top_panel
 
-        tooltip_panel = tk.Frame(top_panel, bg=BACKGROUND_PANEL_COLOR)
-        tooltip_panel.pack(side=tk.LEFT, padx=16, pady=8)
+        nav_row = tk.Frame(top_panel, bg=BACKGROUND_PANEL_COLOR)
+        nav_row.pack(fill=tk.X, padx=14, pady=(10, 4))
 
-        self.create_tooltip(tooltip_panel, "ЛКМ", "войти", ACCENT_COLOR).pack(side=tk.LEFT, padx=(0, 12))
-        self.create_tooltip(tooltip_panel, "ПКМ", "меню", ACCENT_COLOR_2).pack(side=tk.LEFT, padx=(0, 12))
-        self.create_tooltip(tooltip_panel, "СКМ", "вид", ACCENT_COLOR_3).pack(side=tk.LEFT, padx=(0, 12))
-        self.create_tooltip(tooltip_panel, "Esc", "домой", TEXT_COLOR_DIM).pack(side=tk.LEFT)
+        self.back_btn = ui_kit.make_button(
+            nav_row, "← Назад", self.go_back, "secondary",
+        )
+        self.back_btn.pack(side=tk.LEFT)
 
-        self.path_var = tk.StringVar(value="Загрузка дисков…")
+        self.home_btn = ui_kit.make_button(
+            nav_row, "🏠 Домой", self.go_home, "secondary",
+        )
+        self.home_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        search_frame = tk.Frame(
+            nav_row, bg=BACKGROUND_PANEL_COLOR_2,
+            highlightthickness=1, highlightbackground=theme.BORDER_COLOR_SOFT,
+        )
+        search_frame.pack(side=tk.RIGHT)
+
         tk.Label(
-            top_panel, textvariable=self.path_var,
-            bg=BACKGROUND_PANEL_COLOR, fg=ACCENT_COLOR,
-            font=("Consolas", 11, "bold"),
-        ).pack(side=tk.RIGHT, padx=16, pady=8)
-
-        toolbar = tk.Frame(top_panel, bg=BACKGROUND_PANEL_COLOR)
-        toolbar.pack(side=tk.RIGHT, padx=16, pady=8)
+            search_frame, text="🔍", bg=BACKGROUND_PANEL_COLOR_2,
+            fg=TEXT_COLOR_DIM, font=theme.FONT_UI,
+        ).pack(side=tk.LEFT, padx=(8, 2))
 
         self.search_entry = tk.Entry(
-            toolbar, bg=BACKGROUND_PANEL_COLOR_2, fg=TEXT_COLOR_MAIN,
-            insertbackground=TEXT_COLOR_MAIN, relief=tk.FLAT, width=20,
+            search_frame, bg=BACKGROUND_PANEL_COLOR_2, fg=TEXT_COLOR_MAIN,
+            insertbackground=TEXT_COLOR_MAIN, relief=tk.FLAT, width=22,
+            bd=0, highlightthickness=0,
         )
-        self.search_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.search_entry.pack(side=tk.LEFT, padx=(0, 4), pady=4)
         self.search_entry.bind("<KeyRelease>", self.on_search_change)
+        self.search_entry.bind("<FocusIn>", self._on_search_focus_in)
+        self.search_entry.bind("<FocusOut>", self._on_search_focus_out)
 
-        tk.Button(
-            toolbar, text="↕ Сортировка", bg=BACKGROUND_PANEL_COLOR_3, fg=TEXT_COLOR_MAIN,
-            relief=tk.FLAT, cursor="hand2", command=self.toggle_sort,
+        self._search_placeholder = "Поиск по имени…"
+        self.search_entry.insert(0, self._search_placeholder)
+        self.search_entry.configure(fg=TEXT_COLOR_DIM_2)
+
+        self.search_clear_label = tk.Label(
+            search_frame, text="✕", bg=BACKGROUND_PANEL_COLOR_2,
+            fg=TEXT_COLOR_DIM_2, cursor="hand2", font=theme.FONT_SMALL_BOLD,
+        )
+        self.search_clear_label.pack(side=tk.LEFT, padx=(0, 8))
+        self.search_clear_label.bind(
+            "<Button-1>", lambda event: self._clear_search()
+        )
+        self.search_clear_label.bind(
+            "<Enter>",
+            lambda event: self.search_clear_label.configure(fg=TEXT_COLOR_MAIN),
+        )
+        self.search_clear_label.bind(
+            "<Leave>",
+            lambda event: self.search_clear_label.configure(fg=TEXT_COLOR_DIM_2),
+        )
+
+        tk.Label(
+            nav_row,
+            text="ЛКМ — войти · ПКМ — меню · СКМ — вид · Esc — домой",
+            bg=BACKGROUND_PANEL_COLOR, fg=TEXT_COLOR_DIM_2,
+            font=theme.FONT_SMALL,
+        ).pack(side=tk.RIGHT, padx=(0, 12))
+
+        self.path_var = tk.StringVar(value="🖥  Мои диски")
+        tk.Label(
+            nav_row, textvariable=self.path_var,
+            bg=BACKGROUND_PANEL_COLOR, fg=TEXT_COLOR_MAIN,
+            font=("Consolas", 11, "bold"), anchor="w", width=1,
+        ).pack(side=tk.LEFT, padx=(16, 12), fill=tk.X, expand=True)
+
+        # ---------- Вторая строка: действия ----------
+        actions_row = tk.Frame(top_panel, bg=BACKGROUND_PANEL_COLOR)
+        actions_row.pack(fill=tk.X, padx=14, pady=(0, 10))
+
+        right_actions = tk.Frame(actions_row, bg=BACKGROUND_PANEL_COLOR)
+        right_actions.pack(side=tk.RIGHT)
+
+        self.view_btn = ui_kit.make_button(
+            right_actions, "↔ Вид", self.toggle_view_mode, "secondary",
+        )
+        self.view_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        ui_kit.make_button(
+            right_actions, "↕ Сортировка", self.toggle_sort, "secondary",
         ).pack(side=tk.LEFT, padx=(0, 8))
 
-        tk.Button(
-            toolbar, text="🏆 Топ-100 по ПК", bg=BACKGROUND_PANEL_COLOR_3, fg=TEXT_COLOR_MAIN,
-            relief=tk.FLAT, cursor="hand2", command=self.show_top_files_window,
+        ui_kit.make_button(
+            right_actions, "🏆 Топ-100", self.show_top_files_window, "secondary",
         ).pack(side=tk.LEFT, padx=(0, 8))
 
-        tk.Button(
-            toolbar, text="📂 Проводник", bg=ACCENT_COLOR_2, fg=TEXT_COLOR_MAIN,
-            font=("Segoe UI", 9, "bold"), relief=tk.FLAT, cursor="hand2",
-            command=self.reveal_current_in_os,
+        ui_kit.make_button(
+            right_actions, "📂 Проводник", self.reveal_current_in_os, "secondary",
         ).pack(side=tk.LEFT, padx=(0, 8))
 
-        tk.Button(
-            toolbar, text="💾 Экспорт CSV", bg=ACCENT_COLOR, fg=BACKGROUND_COLOR,
-            font=("Segoe UI", 9, "bold"), relief=tk.FLAT, cursor="hand2",
-            command=self.export_to_csv,
+        self.refresh_btn = ui_kit.make_button(
+            right_actions, "↻ Обновить", self.refresh_disks, "secondary",
+        )
+        self.refresh_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        ui_kit.make_button(
+            right_actions, "💾 Экспорт", self.export_to_csv, "primary",
         ).pack(side=tk.LEFT)
+
+        # Привязка F5
+        self.bind("<F5>", lambda e: self.refresh_disks())
 
         # --- Figure ---
         self.figure = Figure(figsize=(10, 7), dpi=100, facecolor=BACKGROUND_COLOR)
         self.axis = self.figure.add_subplot(111)
         self.axis.set_facecolor(BACKGROUND_COLOR)
 
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.viz_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         self.canvas.mpl_connect("button_press_event", self.on_click)
@@ -338,41 +499,170 @@ class DiskVisualizer(tk.Tk):
         widget.bind("<Button-5>", self.on_mouse_wheel)
         widget.bind("<Escape>", lambda event: self.go_home())
 
-        # --- Нижняя панель ---
-        bottom_panel = tk.Frame(self, bg=BACKGROUND_PANEL_COLOR, height=32)
+        # ---------- Нижняя панель: статус ----------
+        bottom_panel = tk.Frame(
+            self.viz_frame, bg=BACKGROUND_PANEL_COLOR, height=FOOTER_HEIGHT,
+        )
         bottom_panel.pack(fill=tk.X, side=tk.BOTTOM)
         bottom_panel.pack_propagate(False)
+        bottom_panel.grid_propagate(False)
+        self.bottom_panel = bottom_panel
+        bottom_panel.grid_columnconfigure(0, weight=1)
 
         self.status_var = tk.StringVar(value="Готово")
-        tk.Label(
+        self.status_label = tk.Label(
             bottom_panel, textvariable=self.status_var,
-            bg=BACKGROUND_PANEL_COLOR, fg=TEXT_COLOR_DIM, font=("Segoe UI", 9),
-        ).pack(side=tk.LEFT, padx=16)
+            bg=BACKGROUND_PANEL_COLOR, fg=TEXT_COLOR_DIM, font=theme.FONT_SMALL,
+            anchor="w", width=1,
+        )
+        self.status_label.grid(row=0, column=0, sticky="we", padx=(14, 12))
+
+        self.progress = ttk.Progressbar(
+            bottom_panel, mode="indeterminate", length=180,
+            style="Accent.Horizontal.TProgressbar",
+        )
+        self.progress.grid(row=0, column=1, padx=(0, 12), sticky="e")
 
         self.mode_var = tk.StringVar(value="● Диаграмма")
-        tk.Label(
+        self.mode_label = tk.Label(
             bottom_panel, textvariable=self.mode_var,
-            bg=BACKGROUND_PANEL_COLOR, fg=ACCENT_COLOR, font=("Segoe UI", 9, "bold"),
-        ).pack(side=tk.RIGHT, padx=16)
+            bg=BACKGROUND_PANEL_COLOR, fg=ACCENT_COLOR,
+            font=theme.FONT_SMALL_BOLD, width=14, anchor="e",
+        )
+        self.mode_label.grid(row=0, column=2, padx=(0, 12))
 
-    def create_tooltip(self, parent, key, action, color):
-        frame = tk.Frame(parent, bg=BACKGROUND_PANEL_COLOR)
-        tk.Label(
-            frame, text=key, bg=color, fg=BACKGROUND_COLOR,
-            font=("Segoe UI", 9, "bold"), padx=8, pady=2,
-        ).pack(side=tk.LEFT)
-        tk.Label(
-            frame, text=action, bg=BACKGROUND_PANEL_COLOR, fg=TEXT_COLOR_MAIN,
-            font=("Segoe UI", 10),
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        return frame
+        ttk.Checkbutton(
+            bottom_panel, text="Автообновление", variable=self.auto_refresh_var,
+            style="TCheckbutton",
+        ).grid(row=0, column=3, padx=(0, 14))
+
+        self._update_nav_buttons()
+
+    # ==================== Поиск и режим ====================
+
+    def _on_search_focus_in(self, _event=None):
+        if self.search_entry.get() == self._search_placeholder:
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.configure(fg=TEXT_COLOR_MAIN)
+
+    def _on_search_focus_out(self, _event=None):
+        if not self.search_entry.get().strip():
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.insert(0, self._search_placeholder)
+            self.search_entry.configure(fg=TEXT_COLOR_DIM_2)
+
+    def _clear_search(self):
+        self.search_entry.delete(0, tk.END)
+        self.search_entry.configure(fg=TEXT_COLOR_MAIN)
+        self.on_search_change(None)
+        try:
+            self.search_entry.focus_set()
+        except tk.TclError:
+            pass
+
+    def _reset_search_placeholder(self):
+        self.search_entry.delete(0, tk.END)
+        self.search_entry.insert(0, self._search_placeholder)
+        self.search_entry.configure(fg=TEXT_COLOR_DIM_2)
+
+    def toggle_view_mode(self):
+        """Переключает режим отображения «диаграмма» ↔ «проводник»."""
+        self.display_mode = "explorer" if self.display_mode == "chart" else "chart"
+        self.mode_var.set(
+            "● Проводник" if self.display_mode == "explorer" else "● Диаграмма"
+        )
+        self.explorer_offset = 0
+        self.hover_index = None
+        self.render_view(animation=True)
+
+    def _update_nav_buttons(self):
+        try:
+            self.back_btn.configure(
+                state=tk.NORMAL if self.history else tk.DISABLED
+            )
+            self.home_btn.configure(
+                state=tk.NORMAL if self.current_path is not None else tk.DISABLED
+            )
+        except tk.TclError:
+            pass
+
+    # ==================== Индикатор занятости ====================
+
+    def start_busy(self, text):
+        """Запускает единый прогресс-бар, не меняя разметку панели."""
+        was_busy = self.busy
+        self.busy_text = text
+        self.busy = True
+        if not was_busy:
+            try:
+                self.progress.start(15)
+            except Exception:
+                pass
+        self.status_var.set(self._clip_status(text))
+        if self._poll_job is None:
+            try:
+                self._poll_job = self.after(100, self._poll_scan_status)
+            except tk.TclError:
+                self._poll_job = None
+
+    @staticmethod
+    def _clip_status(text, limit=110):
+        text = " ".join(str(text).split())
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    def update_busy(self, text):
+        if self.busy:
+            self.busy_text = text
+            self.status_var.set(self._clip_status(text))
+
+    def _poll_scan_status(self):
+        """Забирает из очереди последний текст прогресса и обновляет статус."""
+        self._poll_job = None
+        if not self.busy:
+            return
+        latest = None
+        while True:
+            try:
+                latest = self._status_queue.get_nowait()
+            except queue.Empty:
+                break
+        if latest is not None:
+            self.update_busy(latest)
+        try:
+            self._poll_job = self.after(100, self._poll_scan_status)
+        except tk.TclError:
+            self._poll_job = None
+
+    def stop_busy(self, text=None):
+        self.busy = False
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        while True:
+            try:
+                self._status_queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self.progress.stop()
+            self.progress.configure(value=0)
+        except Exception:
+            pass
+        if text is not None:
+            self.status_var.set(self._clip_status(text))
 
     # ==================== Загрузка дисков ====================
 
     def load_disks_async(self):
-        self.status_var.set("Сканирование дисков…")
+        self._scan_cancel.set()
         self.scan_token += 1
         token = self.scan_token
+        self.start_busy("Сканирование дисков…")
 
         def worker():
             disks = []
@@ -386,9 +676,73 @@ class DiskVisualizer(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _auto_refresh_tick(self):
+        """Раз в несколько секунд проверяет, изменился ли текущий каталог."""
+        try:
+            if (
+                self.auto_refresh_var.get()
+                and not self.busy
+                and self.current_path
+                and self._current_dir_mtime is not None
+            ):
+                try:
+                    mtime = os.stat(self.current_path).st_mtime
+                except OSError:
+                    mtime = None
+                if mtime is not None and mtime != self._current_dir_mtime:
+                    self._current_dir_mtime = mtime
+                    # Полное пересканирование большого среза ради автообновления
+                    # подвешивает интерфейс сильнее, чем просроченные размеры.
+                    if len(self.current_items) > AUTO_REFRESH_MAX_ITEMS:
+                        return
+                    self.invalidate_cache(self.current_path)
+                    self._start_directory_scan(self.current_path, push_history=False)
+        finally:
+            self._auto_job = self.after(
+                AUTO_REFRESH_INTERVAL_MS, self._auto_refresh_tick,
+            )
+
+    def refresh_disks(self):
+        """Пересканировать текущее место с полной инвалидацией кэша."""
+        self.size_cache.clear()
+        if self.current_path is None:
+            self.load_disks_async()
+            return
+
+        self._scan_cancel.set()
+        cancel_event = threading.Event()
+        self._scan_cancel = cancel_event
+
+        path = self.current_path
+        self.scan_token += 1
+        token = self.scan_token
+        self.start_busy(f"Обновление {path}…")
+
+        def worker():
+            items = self.scan_directory(path, cancel_event=cancel_event)
+            if cancel_event.is_set():
+                return
+            self.after(
+                0,
+                lambda: self._on_directory_scanned(token, path, items, push_history=False),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def invalidate_cache(self, prefix):
+        """Удаляет из кэша размеры для указанного каталога и всех вложенных."""
+        if not prefix:
+            self.size_cache.clear()
+            return
+        norm_prefix = os.path.normcase(prefix)
+        for key in list(self.size_cache.keys()):
+            if os.path.normcase(key).startswith(norm_prefix):
+                self.size_cache.pop(key, None)
+
     def _on_disks_loaded(self, token, disks):
         if token != self.scan_token:
             return
+        self.stop_busy()
         if not disks:
             self.status_var.set("Диски не найдены.")
             return
@@ -396,9 +750,11 @@ class DiskVisualizer(tk.Tk):
         self.current_path = None
         self.history.clear()
         self.size_cache.clear()
+        self._current_dir_mtime = None
         self.current_items = list(disks)
         self.apply_filter()
         self.path_var.set("🖥  Мои диски")
+        self._update_nav_buttons()
         total_size = sum(size for _, size in disks)
         self.status_var.set(
             f"Найдено дисков: {len(disks)} | Всего занято: {get_readable_size(total_size)}"
@@ -451,6 +807,19 @@ class DiskVisualizer(tk.Tk):
                 self.after_cancel(self.animation_job)
             except Exception:
                 pass
+
+        # Анимация — это 14 полных перерисовок холста подряд. В режиме
+        # «Проводник» анимировать нечего (секторов нет), а перерисовка
+        # дорогая, поэтому там она всегда пропускается. В режиме диаграммы
+        # пропускается на больших срезах.
+        if self.display_mode != "chart" or len(self.segments) > ANIMATION_MAX_ITEMS:
+            self.animation_state = 1.0
+            self.animation_job = None
+            self.apply_animation()
+            if self.display_mode == "explorer":
+                self.after(30, self._prepare_blit_background)
+            return
+
         self.animation_state = 0.0
 
         def tick():
@@ -687,6 +1056,12 @@ class DiskVisualizer(tk.Tk):
                 e["text_y"] += offset_y
 
         # --- Рисуем сектора ---
+        # Обводка текста рисуется в 3+ прохода и является самой дорогой
+        # операцией при отрисовке. На больших срезах от неё отказываемся.
+        use_stroke = count <= LABEL_STROKE_MAX_ITEMS
+        stroke_inner = [pe.withStroke(linewidth=2.4, foreground="#000000")] if use_stroke else None
+        stroke_radial = [pe.withStroke(linewidth=2.0, foreground="#000000")] if use_stroke else None
+
         fig_segments, _ = self.axis.pie(
             display_angles,
             colors=colors,
@@ -738,7 +1113,7 @@ class DiskVisualizer(tk.Tk):
                             size_str, ha="center", va="center",
                             rotation=text_angle, rotation_mode="anchor",
                             color="white", fontsize=font_size, fontweight="bold",
-                            path_effects=[pe.withStroke(linewidth=2.4, foreground="#000000")],
+                            path_effects=stroke_inner,
                             zorder=9,
                         )
                         self.labels.append(text)
@@ -765,7 +1140,7 @@ class DiskVisualizer(tk.Tk):
                             size_str, ha="center", va="center",
                             rotation=radial_angle, rotation_mode="anchor",
                             color="white", fontsize=font_size, fontweight="bold",
-                            path_effects=[pe.withStroke(linewidth=2.0, foreground="#000000")],
+                            path_effects=stroke_radial,
                             zorder=9,
                         )
                         self.labels.append(text)
@@ -778,12 +1153,14 @@ class DiskVisualizer(tk.Tk):
                     center_x * outer_radius, center_y * outer_radius,
                     size_str, ha="center", va="center",
                     color="white", fontsize=4.5, fontweight="bold",
-                    path_effects=[pe.withStroke(linewidth=2.0, foreground="#000000")],
+                    path_effects=stroke_radial,
                     zorder=9,
                 )
                 self.labels.append(text)
 
         # --- Выноски ---
+        stroke_label = [pe.withStroke(linewidth=3, foreground=BACKGROUND_COLOR)] if use_stroke else None
+
         for e in sorted_records:
             center_x, center_y = e["center_x"], e["center_y"]
             color = e["color"]
@@ -839,7 +1216,7 @@ class DiskVisualizer(tk.Tk):
             label_text = self.axis.text(
                 text_x, y_text, e["text"], ha=text_align, va="center",
                 color=color, fontsize=font_size_out, fontweight="bold",
-                path_effects=[pe.withStroke(linewidth=3, foreground=BACKGROUND_COLOR)],
+                path_effects=stroke_label,
                 zorder=7,
             )
             self.labels.append(label_text)
@@ -911,7 +1288,7 @@ class DiskVisualizer(tk.Tk):
 
     def render_explorer(self):
         data = self._sorted_explorer_data()
-        total_size = sum(size for _, size in data)
+        total_size = sum(size for _, size, _ in data)
 
         if not data:
             self.axis.text(
@@ -954,11 +1331,7 @@ class DiskVisualizer(tk.Tk):
         end_idx = min(start_idx + self.explorer_max_rows, count)
         visible_data = data[start_idx:end_idx]
 
-        name_to_filtered = {name: i for i, (name, _) in enumerate(self.filtered_items)}
-
-        for i, (name, size) in enumerate(visible_data):
-            item_index = name_to_filtered.get(name, None)
-
+        for i, (name, size, item_index) in enumerate(visible_data):
             y = top_y - i * row_height
             share = size / total_size if total_size > 0 else 0.0
             color = get_color_for_level(depth, i)
@@ -1061,10 +1434,28 @@ class DiskVisualizer(tk.Tk):
     # ==================== Вспомогательные ====================
 
     def _sorted_explorer_data(self):
-        data = [(n, s) for n, s in self.filtered_items if s > 0]
-        if self.sort_by_size:
-            return sorted(data, key=lambda x: x[1], reverse=True)
-        return sorted(data, key=lambda x: x[0].lower())
+        """Отсортированный вид с индексами в filtered_items.
+
+        Список кэшируется и пересобирается только при смене данных, фильтра
+        или режима сортировки. Без кэша полная сортировка и построение
+        словаря имён выполнялись на каждое событие колеса мыши, что на
+        каталогах с десятками тысяч записей полностью вешало интерфейс.
+        """
+        if self._explorer_sorted is None:
+            data = [
+                (name, size, index)
+                for index, (name, size) in enumerate(self.filtered_items)
+                if size > 0
+            ]
+            if self.sort_by_size:
+                data.sort(key=lambda item: item[1], reverse=True)
+            else:
+                data.sort(key=lambda item: item[0].lower())
+            self._explorer_sorted = data
+        return self._explorer_sorted
+
+    def _invalidate_explorer_cache(self):
+        self._explorer_sorted = None
 
     # ==================== Blitting ====================
 
@@ -1108,11 +1499,7 @@ class DiskVisualizer(tk.Tk):
 
     def on_click(self, event):
         if event.button == 2:
-            self.display_mode = "explorer" if self.display_mode == "chart" else "chart"
-            self.mode_var.set("● Проводник" if self.display_mode == "explorer" else "● Диаграмма")
-            self.explorer_offset = 0
-            self.hover_index = None
-            self.render_view(animation=True)
+            self.toggle_view_mode()
             return
 
         if event.button == 3:
@@ -1315,7 +1702,9 @@ class DiskVisualizer(tk.Tk):
 
         self.explorer_offset = new_offset
         self.hover_index = None
-        self.render_view(animation=False)
+        # Колесо мыши генерирует события быстрее, чем matplotlib успевает
+        # отрисовать кадр. Дебаунс схлопывает пачку событий в одну перерисовку.
+        self._schedule_render(WHEEL_DEBOUNCE_MS)
 
     def set_cursor(self, name):
         try:
@@ -1436,27 +1825,69 @@ class DiskVisualizer(tk.Tk):
             self.status_var.set(f"Не является каталогом: {target}")
             return
 
-        self.status_var.set(f"Сканирование {target}…")
+        # Данные могли измениться с прошлого визита — сбрасываем кэш для этой ветки
+        self.invalidate_cache(target)
+        self._start_directory_scan(target, push_history=True)
+
+    def _start_directory_scan(self, path, push_history):
+        self._scan_cancel.set()
+        cancel_event = threading.Event()
+        self._scan_cancel = cancel_event
+
         self.scan_token += 1
         token = self.scan_token
+        self.start_busy(f"Сканирование {path}…")
+
+        def on_progress(current_dir, files_seen, bytes_seen):
+            name = os.path.basename(str(current_dir).rstrip("\\/")) or str(current_dir)
+            text = (
+                f"Сканирование: {name} · файлов: {files_seen:,} · "
+                f"{get_readable_size(bytes_seen)}"
+            ).replace(",", " ")
+            try:
+                self._status_queue.put_nowait(text)
+            except queue.Full:
+                try:
+                    self._status_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._status_queue.put_nowait(text)
+                except queue.Full:
+                    pass
 
         def worker():
-            items = self.scan_directory(target)
-            self.after(0, lambda: self._on_directory_scanned(token, target, items, push_history=True))
+            items = self.scan_directory(
+                path, progress_cb=on_progress, cancel_event=cancel_event,
+            )
+            if cancel_event.is_set():
+                return
+            self.after(
+                0,
+                lambda: self._on_directory_scanned(token, path, items, push_history),
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def scan_directory(self, path):
+    def scan_directory(self, path, progress_cb=None, cancel_event=None):
         results = []
+        if cancel_event is not None and cancel_event.is_set():
+            return results
         try:
             entries = list(os.scandir(path))
         except OSError:
             return results
 
         for entry in entries:
+            if cancel_event is not None and cancel_event.is_set():
+                return results
             try:
                 if entry.is_dir(follow_symlinks=False):
-                    size = get_directory_size(entry.path, self.size_cache)
+                    size = get_directory_size(
+                        entry.path, self.size_cache, progress_cb, cancel_event,
+                    )
+                    if size is None:
+                        return results
                     results.append((entry.name + os.sep, size))
                 else:
                     size = entry.stat(follow_symlinks=False).st_size
@@ -1474,15 +1905,20 @@ class DiskVisualizer(tk.Tk):
         if push_history:
             self.history.append(self.current_path)
         self.current_path = path
+        try:
+            self._current_dir_mtime = os.stat(path).st_mtime
+        except OSError:
+            self._current_dir_mtime = None
         self.current_items = items
         self.explorer_offset = 0
         self.hover_index = None
         self.apply_filter()
         self.path_var.set(f"📁  {path}")
         total_size = sum(s for _, s in items)
-        self.status_var.set(
+        self.stop_busy(
             f"Элементов: {len(items)} | Всего: {get_readable_size(total_size)}"
         )
+        self._update_nav_buttons()
         self.render_view(animation=True)
 
     def go_back(self):
@@ -1494,22 +1930,15 @@ class DiskVisualizer(tk.Tk):
             self.load_disks_async()
             return
 
-        self.status_var.set(f"Возврат в {prev}…")
-        self.scan_token += 1
-        token = self.scan_token
-
-        def worker():
-            items = self.scan_directory(prev)
-            self.after(0, lambda: self._on_directory_scanned(token, prev, items, push_history=False))
-
-        threading.Thread(target=worker, daemon=True).start()
+        self.invalidate_cache(prev)
+        self._start_directory_scan(prev, push_history=False)
 
     def go_home(self):
         if self.current_path is None:
             self.status_var.set("Это верхний уровень.")
             return
         self.history.clear()
-        self.search_entry.delete(0, tk.END)
+        self._reset_search_placeholder()
         self.explorer_offset = 0
         self.hover_index = None
         self.load_disks_async()
@@ -1518,10 +1947,38 @@ class DiskVisualizer(tk.Tk):
         self.apply_filter()
         self.explorer_offset = 0
         self.hover_index = None
+        self._schedule_render()
+
+    def toggle_sort(self):
+        self.sort_by_size = not self.sort_by_size
+        self.explorer_offset = 0
+        self.hover_index = None
+        self._invalidate_explorer_cache()
+        self.render_view(animation=False)
+
+    # ==================== Дебаунс перерисовки ====================
+
+    def _schedule_render(self, delay=None):
+        """Дебаунс перерисовки — набор текста или движение мыши генерирует
+        события быстрее, чем matplotlib успевает отрисовать предыдущий кадр.
+        Ждём ~150 мс после последнего события и делаем одну перерисовку."""
+        if self._render_job is not None:
+            try:
+                self.after_cancel(self._render_job)
+            except Exception:
+                pass
+        if delay is None:
+            delay = SEARCH_RENDER_DELAY_MS
+        self._render_job = self.after(delay, self._do_render)
+
+    def _do_render(self):
+        self._render_job = None
         self.render_view(animation=False)
 
     def apply_filter(self):
         search_text = self.search_entry.get().strip().lower()
+        if search_text == self._search_placeholder.lower():
+            search_text = ""
         if not search_text:
             self.filtered_items = list(self.current_items)
         else:
@@ -1530,12 +1987,7 @@ class DiskVisualizer(tk.Tk):
                 for name, size in self.current_items
                 if search_text in name.lower()
             ]
-
-    def toggle_sort(self):
-        self.sort_by_size = not self.sort_by_size
-        self.explorer_offset = 0
-        self.hover_index = None
-        self.render_view(animation=False)
+        self._invalidate_explorer_cache()
 
     def reveal_current_in_os(self):
         if self.current_path:

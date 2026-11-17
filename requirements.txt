@@ -1,2 +1,3 @@
 matplotlib
 psutil
+send2trash
